@@ -708,8 +708,19 @@ void GetChunkOfInput(const absl::string_view input,
     norm_to_orig_chunk = absl::Span<const size_t>();
     return;
   }
-  const int normalized_end_index =
-      (normalized_end_it - norm_to_orig.begin()) - 1;
+  int normalized_end_index = (normalized_end_it - norm_to_orig.begin()) - 1;
+  // All bytes that the normalizer emits for one input position (a multi-byte
+  // character, U+2581 for a space, a user defined symbol, ...) share the same
+  // original offset, so the index above can point into the middle of them.
+  // Move back to the first of them so that the chunk does not end with a
+  // partial character or symbol.
+  if (normalized_end_index < static_cast<int>(normalized.size())) {
+    const size_t end_offset = norm_to_orig[normalized_end_index];
+    while (normalized_end_index > normalized_start_index &&
+           norm_to_orig[normalized_end_index - 1] == end_offset) {
+      --normalized_end_index;
+    }
+  }
   normalized_chunk =
       absl::ClippedSubstr(normalized, normalized_start_index,
                           normalized_end_index - normalized_start_index);
@@ -728,7 +739,14 @@ bool FindMatchingToken(const SentencePieceText_SentencePiece& current_piece,
 
   // Two tokens match if:
   //   - They have the same surface form and same start and end indices.
-  //   - They are both UNK and overlap.
+  //   - They are both UNK, end at the same index, and the one in the next
+  //     chunk is not zero width. A run of unknown characters is one merged
+  //     UNK piece, so the two pieces start at different indices when the run
+  //     crosses the chunk boundary. UNK pieces that only overlap can belong
+  //     to different runs: a character normalized to several characters
+  //     (e.g. U+00BD to "1", U+2044, "2") gives pieces that all map to the
+  //     same index. A zero-width UNK piece at the start of the next chunk
+  //     would be skipped as dummy WS.
   // Note that we only match non zero-width tokens, to avoid matching dummy WS
   // and byte tokens.
   for (const auto& other_piece : next_chunk.pieces()) {
@@ -737,8 +755,8 @@ bool FindMatchingToken(const SentencePieceText_SentencePiece& current_piece,
          other_piece.end() + chunk_len == current_piece.end()) ||
         (unk_id >= 0 && current_piece.id() == static_cast<uint32_t>(unk_id) &&
          other_piece.id() == static_cast<uint32_t>(unk_id) &&
-         other_piece.begin() <= current_piece.end() - chunk_len &&
-         current_piece.end() - chunk_len <= other_piece.end())) {
+         other_piece.begin() != other_piece.end() &&
+         other_piece.end() + chunk_len == current_piece.end())) {
       if (current_piece.begin() != current_piece.end()) {
         found_matching_token = true;
         *start_index_in_next_chunk = other_piece.end();
@@ -1002,9 +1020,15 @@ absl::Status SentencePieceProcessor::ParallelEncodeInternal(
         }
 
         // Try to find a matching token in the next chunk for this token.
-        // Don't match zero width pieces.
+        // Don't match zero width pieces. Don't match an UNK piece that ends
+        // the chunk either: the run of unknown characters can go on in the
+        // next chunk, even when the UNK piece there ends at the same index
+        // (e.g. U+2103 is normalized to a degree sign and "C", and the degree
+        // sign joins the run).
+        const bool is_last_unk = &piece == &*spt_chunks[i]->pieces().rbegin() &&
+                                 IsUnknownId(*model_, unk_id_, piece.id());
         if (i < spt_chunks.size() - 1 && piece.begin() != piece.end() &&
-            piece.end() >= this_chunk_len) {
+            piece.end() >= this_chunk_len && !is_last_unk) {
           found_matching_token =
               FindMatchingToken(piece, *spt_chunks[i + 1], this_chunk_len,
                                 unk_id(), &start_of_good_tokens);

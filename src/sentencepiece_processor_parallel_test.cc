@@ -138,6 +138,62 @@ TEST(SentencepieceProcessorTest, ParallelEncodeTestJaWithUNK) {
   }
 }
 
+TEST(SentencepieceProcessorTest, ParallelEncodeTestUNKAtChunkBoundary) {
+  // The model has no byte fallback, so each run of characters that it does
+  // not cover ('|', Japanese, '~', ...) becomes one <unk> piece.
+  const std::string test_model_file = filesystem::JoinPath(
+      ::testing::SrcDir(), "botchan_en_unigram_1000.model");
+
+  SentencePieceProcessor sp;
+  CHECK_OK(sp.Load(test_model_file));
+
+  // The normalizer matches a user defined symbol as one unit, so all of its
+  // bytes map to the same original offset.
+  ModelProto model_proto = sp.model_proto();
+  auto* sep = model_proto.add_pieces();
+  sep->set_piece("<sep>");
+  sep->set_type(ModelProto::SentencePiece::USER_DEFINED);
+  CHECK_OK(sp.Load(model_proto));
+
+  ThreadPool thread_pool(4);
+
+  std::string ja_run;
+  for (int i = 0; i < 20; ++i) absl::StrAppend(&ja_run, "あいうえお");
+  const std::string bar_run(100, '|');
+
+  // U+2103, U+FDFA and U+00BD are normalized to several characters ("°C", an
+  // Arabic phrase, "1⁄2") that all map to the same original offset, and some
+  // of them are not in the vocabulary.
+  for (const std::string& input :
+       {absl::StrCat("abc ", bar_run, " def"),
+        absl::StrCat("abc ", ja_run, " def"),
+        absl::StrCat("abc ", bar_run, "<sep> def"),
+        absl::StrCat("abc ", bar_run, "\xE2\x84\x83 def"),
+        absl::StrCat("abc ", bar_run, "\xEF\xB7\xBA def"),
+        std::string("Price: ~\xC2\xBD lb")}) {
+    std::vector<int> expected_ids;
+    std::vector<std::string> expected_pieces;
+    SentencePieceText expected_spt;
+    CHECK_OK(sp.Encode(input, &expected_ids));
+    CHECK_OK(sp.Encode(input, &expected_pieces));
+    CHECK_OK(sp.Encode(input, &expected_spt));
+
+    for (int chunk_size = 1; chunk_size <= 128; ++chunk_size) {
+      SCOPED_TRACE(absl::StrCat("input=", input, " chunk_size=", chunk_size));
+      std::vector<int> actual_ids;
+      std::vector<std::string> actual_pieces;
+      SentencePieceText actual_spt;
+      CHECK_OK(sp.ParallelEncode(input, chunk_size, thread_pool, &actual_ids));
+      CHECK_OK(
+          sp.ParallelEncode(input, chunk_size, thread_pool, &actual_pieces));
+      CHECK_OK(sp.ParallelEncode(input, chunk_size, thread_pool, &actual_spt));
+      EXPECT_EQ(expected_ids, actual_ids);
+      EXPECT_EQ(expected_pieces, actual_pieces);
+      ExpectSptEqual(expected_spt, actual_spt);
+    }
+  }
+}
+
 TEST(SentencepieceProcessorTest, ParallelEncodeTestJaWithByte) {
   // Check Japanese tokenized correctly in parallel
   const std::string test_model_file = filesystem::JoinPath(
